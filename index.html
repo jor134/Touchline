@@ -175,7 +175,7 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
 #pad{position:fixed;inset:0;z-index:18;pointer-events:none;display:none}
 #pad.on{display:block}
 #stickzone{position:absolute;left:0;bottom:0;width:46%;height:64%;pointer-events:auto}
-#stick{position:absolute;width:108px;height:108px;border-radius:50%;
+#stick{position:fixed;width:108px;height:108px;border-radius:50%;
   border:2px solid rgba(232,238,242,.26);background:rgba(21,29,37,.32);
   transform:translate(-50%,-50%);opacity:0;transition:opacity .14s;pointer-events:none}
 #stick.on{opacity:1}
@@ -242,7 +242,8 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
 <div id="ov"><div id="card"></div></div>
 <div id="rot"><div class="ic">📱</div><p>Turn your phone sideways.<br>The pitch needs the width.</p></div>
 <div id="pad">
-  <div id="stickzone"><div id="stick"><div id="knob"></div></div></div>
+  <div id="stickzone"></div>
+  <div id="stick"><div id="knob"></div></div>
   <div id="acts">
     <div class="act sm" id="aSwitch">SWITCH</div>
     <div class="act" id="aPass">PASS</div>
@@ -970,6 +971,7 @@ function simMatch(homeLines, awayLines, tune, seed){
    ============================================================ */
 let scene, cam, renderer, clockT=0;
 let PLAYERS=[], ballMesh, ballGrp, shadowMesh, pitchMesh, selRing, aimPass, aimShoot, aimRing;
+const BASE_FOV = 34, TV_FOV = 26;   // TV uses a longer lens to zoom on play
 let QUALITY = 2;                 // 2 = full outlines, 1 = body only, 0 = none
 let CAMMODE = 0;                 // 0 tactical, 1 overhead, 2 broadcast
 const camPos = new THREE.Vector3(), camLook = new THREE.Vector3();
@@ -1302,29 +1304,32 @@ function renderFrame(S, dt){
 
 function updateCamera(S, dt){
   const b=S.ball;
-  let tx,ty,tz, lx,ly,lz;
+  let tx,ty,tz, lx,ly,lz, fov=BASE_FOV;
   if(CAMMODE===0){                       // tactical — whole pitch, angled
-    const d = fitDistance();
+    const d = fitDistance(BASE_FOV);
     tx=0; ty=d*0.86; tz=d*0.50; lx=0; ly=0; lz=2;
   } else if(CAMMODE===1){                // overhead — pure shape read
-    const d = fitDistance();
+    const d = fitDistance(BASE_FOV);
     tx=0; ty=d*1.02; tz=0.01; lx=0; ly=0; lz=0;
-  } else {                               // broadcast — follows play from outside the pitch
-    const d = fitDistance()*0.66;
-    tx = clamp(b.x*0.48,-22,22);
-    ty = d*0.56;
-    tz = d*0.84 + b.z*0.10;
-    lx = clamp(b.x*0.80,-40,40); ly=0; lz=b.z*0.22;
+  } else {                               // broadcast — tight on the ball, longer lens
+    const fx = clamp(b.x, -40, 40), fz = clamp(b.z*0.6, -17, 17);
+    tx = fx*0.88; ty = 27; tz = 47 + fz*0.25;   // never inside the touchline
+    lx = fx; ly = 1; lz = fz;
+    fov = TV_FOV;
   }
-  const k = Math.min(1, dt*(CAMMODE===2?2.6:4.5));
+  if(Math.abs(cam.fov-fov)>0.03){
+    cam.fov += (fov-cam.fov)*Math.min(1, dt*3.5);
+    cam.updateProjectionMatrix();
+  }
+  const k = Math.min(1, dt*(CAMMODE===2?3.2:4.5));
   camPos.lerp(_v3.set(tx,ty,tz), k);
   camLook.lerp(_v3.set(lx,ly,lz), k);
   cam.position.copy(camPos);
   cam.lookAt(camLook);
 }
-function fitDistance(){
+function fitDistance(fovDeg){
   const aspect = innerWidth/innerHeight;
-  const vFov = cam.fov*Math.PI/180;
+  const vFov = (fovDeg||BASE_FOV)*Math.PI/180;
   const needV = (PW+20)/2 / Math.tan(vFov/2);
   const needH = (PL+16)/2 / Math.tan(Math.atan(Math.tan(vFov/2)*aspect));
   return Math.max(needV, needH)*1.06;
