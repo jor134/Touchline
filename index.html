@@ -19,7 +19,7 @@
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;overflow:hidden;background:var(--ink);color:var(--chalk);
   font-family:Inter,system-ui,sans-serif;overscroll-behavior:none;touch-action:manipulation}
-#gl{position:fixed;inset:0;display:block}
+#gl{position:fixed;top:0;left:0;width:100%;height:100%;display:block}
 .num{font-family:'Barlow Condensed',Impact,sans-serif;font-variant-numeric:tabular-nums;letter-spacing:.01em}
 
 /* ---------- scoreboard ---------- */
@@ -172,6 +172,25 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
 #rot .ic{font-size:44px}
 #rot p{font-size:13px;color:var(--dim);line-height:1.6}
 @media (orientation:portrait) and (max-height:900px){ }
+#pad{position:fixed;inset:0;z-index:18;pointer-events:none;display:none}
+#pad.on{display:block}
+#stickzone{position:absolute;left:0;bottom:0;width:46%;height:64%;pointer-events:auto}
+#stick{position:absolute;width:108px;height:108px;border-radius:50%;
+  border:2px solid rgba(232,238,242,.26);background:rgba(21,29,37,.32);
+  transform:translate(-50%,-50%);opacity:0;transition:opacity .14s;pointer-events:none}
+#stick.on{opacity:1}
+#knob{position:absolute;left:50%;top:50%;width:48px;height:48px;border-radius:50%;
+  background:rgba(232,238,242,.88);transform:translate(-50%,-50%);
+  box-shadow:0 2px 12px rgba(0,0,0,.55)}
+#acts{position:absolute;right:14px;bottom:calc(14px + var(--pad));
+  display:flex;gap:11px;align-items:flex-end;pointer-events:auto}
+.act{width:76px;height:76px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-family:'Barlow Condensed';font-weight:700;font-size:15px;letter-spacing:.09em;
+  border:2px solid rgba(232,238,242,.28);background:rgba(21,29,37,.72);
+  backdrop-filter:blur(10px);color:var(--chalk);cursor:pointer;user-select:none}
+.act:active{transform:scale(.92)}
+.act.pri{background:rgba(226,69,61,.82);border-color:rgba(226,69,61,.9)}
+.act.sm{width:60px;height:60px;font-size:12px}
 #toast{position:fixed;left:50%;bottom:calc(50px + var(--pad));transform:translateX(-50%) translateY(14px);
   background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 14px;
   font-size:11.5px;color:var(--chalk);z-index:30;opacity:0;pointer-events:none;transition:.25s;white-space:nowrap}
@@ -221,6 +240,14 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
 
 <div id="ov"><div id="card"></div></div>
 <div id="rot"><div class="ic">📱</div><p>Turn your phone sideways.<br>The pitch needs the width.</p></div>
+<div id="pad">
+  <div id="stickzone"><div id="stick"><div id="knob"></div></div></div>
+  <div id="acts">
+    <div class="act sm" id="aSwitch">SWITCH</div>
+    <div class="act" id="aPass">PASS</div>
+    <div class="act pri" id="aShoot">SHOOT</div>
+  </div>
+</div>
 <div id="toast"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -244,6 +271,10 @@ function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a
   t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
 
 const LINE_KEYS = ['DEF','DM','MID','FWD'];
+
+/* Human control. When active the chosen player ignores the AI and takes the
+   stick; every other player on the pitch keeps behaving normally. */
+const CTRL = { active:false, side:0, player:null, mx:0, mz:0, holdT:0 };
 
 /* ---- shape label: "4-2-3-1", collapsing empty bands ---- */
 function shapeLabel(lines){ return lines.filter(n=>n>0).join('-'); }
@@ -457,6 +488,7 @@ function decide(S, dt){
   const b=S.ball; if(!b.owner) return;
   S.decideT -= dt; if(S.decideT>0) return;
   const p=b.owner, team=p.team, dir=team.dir, ti=team===S.teams[0]?0:1;
+  if(CTRL.active && CTRL.side===ti && p===CTRL.player && !p.gk){ S.decideT=0.25; return; }
   S.decideT = lerp(3.20,1.55,team.tempo) * (0.7+S.rng()*0.6);
 
   const st=S.stats[ti];
@@ -576,6 +608,17 @@ function updateTeam(S, ti, dt){
       continue;
     }
     let tx,tz,spd=baseSpd*(p.agi||1);
+
+    if(CTRL.active && CTRL.side===ti && p===CTRL.player){
+      const mag=Math.hypot(CTRL.mx,CTRL.mz);
+      if(mag>0.10){
+        const ux=CTRL.mx/mag, uz=CTRL.mz/mag;
+        tx=p.x+ux*9; tz=p.z+uz*9;
+        spd *= lerp(0.55,1.14,Math.min(mag,1)) * (b.owner===p?0.90:1.0);
+      } else { tx=p.x; tz=p.z; }
+      steer(p,tx,tz,spd,dt);
+      continue;
+    }
 
     if(b.owner===p){
       const [o,od]=nearestTo(opp.players,p.x,p.z);
@@ -787,10 +830,69 @@ function resetPositions(S, kickTeam){
   }
 }
 
+function updateControl(S){
+  if(!CTRL.active){ CTRL.player=null; return; }
+  const team=S.teams[CTRL.side], b=S.ball;
+  CTRL.holdT=Math.max(0,CTRL.holdT-0.05);
+  if(b.owner && b.owner.team===team && !b.owner.gk){ CTRL.player=b.owner; return; }
+  if(CTRL.holdT>0 && CTRL.player) return;
+  let best=null,bd=1e9;
+  for(const p of team.players){ if(p.gk) continue;
+    const d=dist2(p.x,p.z,b.x,b.z); if(d<bd){bd=d;best=p;} }
+  if(best) CTRL.player=best;
+}
+function cycleControl(S){
+  if(!CTRL.active) return;
+  const team=S.teams[CTRL.side], out=team.players.filter(p=>!p.gk);
+  const rank=out.map(p=>[p,dist2(p.x,p.z,S.ball.x,S.ball.z)]).sort((a,b)=>a[1]-b[1]);
+  const i=rank.findIndex(r=>r[0]===CTRL.player);
+  CTRL.player = rank[(i+1)%rank.length][0];
+  CTRL.holdT = 2.2;
+}
+function humanShoot(S){
+  const b=S.ball, p=b.owner;
+  if(!p||p.gk||!CTRL.active||p!==CTRL.player) return false;
+  const team=p.team, ti=S.teams.indexOf(team), dir=team.dir, gx=dir*HL;
+  const q=shotQuality(S,p,team);
+  S.stats[ti].shots++; S.stats[ti].xg += q*0.30;
+  const aimZ=clamp((S.rng()*2-1)*GPOST*0.82,-GPOST*0.9,GPOST*0.9);
+  const acc=lerp(0.105,0.028,q);
+  kickBall(S,b,gx,aimZ,25+S.rng()*7,1.3+S.rng()*2.4,acc);
+  b.passer=p; b.intended=null; b.passT=S.clock; b.shot=true; b.offsideFlag=false;
+  const tt=(gx-b.x)/(b.vx||1e-6), cz=b.z+b.vz*tt, cy=b.y+b.vy*tt-0.5*17.5*tt*tt;
+  b.onTarget=(tt>0&&Math.abs(cz)<GPOST&&cy>0&&cy<GBAR);
+  if(b.onTarget) S.stats[ti].sot++;
+  S.decideT=0.7; S.event={type:'shot',team:ti};
+  return true;
+}
+function humanPass(S){
+  const b=S.ball, p=b.owner;
+  if(!p||p.gk||!CTRL.active||p!==CTRL.player) return false;
+  const team=p.team, ti=S.teams.indexOf(team);
+  const opts=passOptions(S,p,team);
+  if(!opts.length) return false;
+  const mag=Math.hypot(CTRL.mx,CTRL.mz);
+  if(mag>0.18){                       // the stick aims the pass
+    const ux=CTRL.mx/mag, uz=CTRL.mz/mag;
+    opts.forEach(o=>{ const dx=o.m.x-p.x, dz=o.m.z-p.z, d=Math.hypot(dx,dz)||1;
+      o.score += ((dx/d)*ux+(dz/d)*uz)*2.4; });
+    opts.sort((a,c)=>c.score-a.score);
+  }
+  const o=opts[0];
+  S.stats[ti].pass++;
+  const lead=clamp(o.d/22,0.15,0.8), err=0.028+o.d*0.0013, lofted=o.d>24;
+  kickBall(S,b,o.m.x+o.m.vx*lead,o.m.z+o.m.vz*lead,
+           clamp(o.d*(lofted?0.95:1.30),8,23), lofted?5.2:0.4, err);
+  b.passer=p; b.intended=o.m; b.shot=false; b.offsideFlag=o.offs; b.passT=S.clock;
+  S.decideT=0.55;
+  return true;
+}
+
 /* ---- step ------------------------------------------------------------ */
 function step(S, dt){
   if(S.ended) return;
   S.event=null;
+  updateControl(S);
   if(S.phase==='kickoff'||S.phase==='restart'){
     S.phaseT-=dt;
     // players drift toward shape while waiting
@@ -839,7 +941,7 @@ function simMatch(homeLines, awayLines, tune, seed){
    RENDERER — cel shading, procedural player animation
    ============================================================ */
 let scene, cam, renderer, clockT=0;
-let PLAYERS=[], ballMesh, ballGrp, shadowMesh, pitchMesh;
+let PLAYERS=[], ballMesh, ballGrp, shadowMesh, pitchMesh, selRing;
 let QUALITY = 2;                 // 2 = full outlines, 1 = body only, 0 = none
 let CAMMODE = 0;                 // 0 tactical, 1 overhead, 2 broadcast
 const camPos = new THREE.Vector3(), camLook = new THREE.Vector3();
@@ -1059,6 +1161,11 @@ function initScene(canvas){
   shadowMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(shadowMesh);
 
+  selRing = new THREE.Mesh(new THREE.RingGeometry(0.52,0.70,22),
+    new THREE.MeshBasicMaterial({color:0xF4F7FA,transparent:true,opacity:0.85,
+      depthWrite:false,side:THREE.DoubleSide}));
+  selRing.rotation.x=-Math.PI/2; selRing.visible=false; scene.add(selRing);
+
   onResize();
   addEventListener('resize', onResize);
 }
@@ -1106,6 +1213,11 @@ function renderFrame(S, dt){
   shadowMesh.count = si;
   shadowMesh.instanceMatrix.needsUpdate = true;
 
+  if(CTRL.active && CTRL.player){
+    selRing.visible=true;
+    selRing.position.set(CTRL.player.x, 0.04, CTRL.player.z);
+  } else selRing.visible=false;
+
   updateCamera(S, dt);
   renderer.render(scene, cam);
 }
@@ -1132,13 +1244,13 @@ function updateCamera(S, dt){
 function fitDistance(){
   const aspect = innerWidth/innerHeight;
   const vFov = cam.fov*Math.PI/180;
-  const needV = (PW+16)/2 / Math.tan(vFov/2);
-  const needH = (PL+14)/2 / Math.tan(Math.atan(Math.tan(vFov/2)*aspect));
-  return Math.max(needV, needH);
+  const needV = (PW+20)/2 / Math.tan(vFov/2);
+  const needH = (PL+16)/2 / Math.tan(Math.atan(Math.tan(vFov/2)*aspect));
+  return Math.max(needV, needH)*1.06;
 }
 function onResize(){
   const w=innerWidth, h=innerHeight;
-  renderer.setSize(w,h,false);
+  renderer.setSize(w,h);
   cam.aspect=w/h; cam.updateProjectionMatrix();
   document.getElementById('rot').classList.toggle('on', h>w && w<520);
 }
@@ -1419,6 +1531,10 @@ function menu(){
       <div class="sg" data-v="180">SHORT</div>
       <div class="sg on" data-v="300">STANDARD</div>
       <div class="sg" data-v="600">LONG</div></div>
+    <h2>HOW YOU PLAY</h2>
+    <div class="seg" id="segCtl">
+      <div class="sg on" data-v="watch">MANAGE ONLY</div>
+      <div class="sg" data-v="play">TAKE CONTROL</div></div>
     <h2>PLAY WITH A FRIEND</h2>
     <div class="seg" id="segMode">
       <div class="sg on" data-v="local">ONE PHONE</div>
@@ -1431,11 +1547,12 @@ function menu(){
     <p style="margin-top:14px;font-size:11px;color:var(--faint)">Both benches are open on one phone —
     swap tabs and pass it around. Formation and levers can change at any moment during play.</p>`, false);
 
-  let len=300, mode='local';
+  let len=300, mode='local', ctl='watch';
   const seg=(id,fn)=>$(id).querySelectorAll('.sg').forEach(d=>d.onclick=()=>{
     $(id).querySelectorAll('.sg').forEach(x=>x.classList.remove('on'));
     d.classList.add('on'); fn(d.dataset.v); });
   seg('segLen',v=>len=+v);
+  seg('segCtl',v=>ctl=v);
   seg('segMode',v=>{ mode=v; roomBox(v); });
   const roomBox=(v)=>{
     if(v==='host'){ G.room=code(); $('roomBox').innerHTML=
@@ -1450,6 +1567,14 @@ function menu(){
       if(v.length!==4){ toast('That code needs four letters.'); return; } G.room=v; }
     G.mode = mode==='join'?'guest':mode;
     G.side = G.mode==='guest'?1:0;
+    CTRL.active = (ctl==='play' && G.mode!=='guest');
+    CTRL.side = G.side; CTRL.player=null; CTRL.mx=CTRL.mz=0;
+    $('pad').classList.toggle('on', CTRL.active);
+    if(CTRL.active){
+      CAMMODE=2; $('tCam').textContent='TV'; $('tCam').classList.add('on');
+      $('dock').classList.add('hid'); $('glbl').textContent='TACTICS';
+    }
+    if(ctl==='play' && mode==='join') toast('Controls are one-phone only for now.');
     startMatch();
     closeOverlay();
     if(G.mode!=='local') startNet();
@@ -1500,6 +1625,67 @@ function pushGuestTactics(){
     t:G.S.teams[1].tempo, w:G.S.teams[1].width});
 }
 
+/* ---------------- on-pitch controls ---------------- */
+function initPad(){
+  const zone=$('stickzone'), stick=$('stick'), knob=$('knob');
+  const R=48; let id=null, ox=0, oy=0;
+
+  const begin=(x,y)=>{ ox=x; oy=y;
+    stick.style.left=x+'px'; stick.style.top=y+'px'; stick.classList.add('on'); };
+  const move=(x,y)=>{ let dx=x-ox, dy=y-oy; const m=Math.hypot(dx,dy);
+    if(m>R){ dx=dx/m*R; dy=dy/m*R; }
+    knob.style.transform=`translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+    CTRL.mx=dx/R; CTRL.mz=dy/R; };
+  const stop=()=>{ id=null; CTRL.mx=0; CTRL.mz=0;
+    stick.classList.remove('on'); knob.style.transform='translate(-50%,-50%)'; };
+
+  zone.addEventListener('touchstart',e=>{ const t=e.changedTouches[0];
+    id=t.identifier; begin(t.clientX,t.clientY); e.preventDefault(); },{passive:false});
+  zone.addEventListener('touchmove',e=>{ for(const t of e.changedTouches){
+    if(t.identifier===id) move(t.clientX,t.clientY); } e.preventDefault(); },{passive:false});
+  zone.addEventListener('touchend',e=>{ for(const t of e.changedTouches)
+    if(t.identifier===id) stop(); });
+  zone.addEventListener('touchcancel',stop);
+
+  // desktop fallback, so this is testable without a phone
+  let mouse=false;
+  zone.addEventListener('mousedown',e=>{ mouse=true; begin(e.clientX,e.clientY); });
+  addEventListener('mousemove',e=>{ if(mouse) move(e.clientX,e.clientY); });
+  addEventListener('mouseup',()=>{ if(mouse){ mouse=false; stop(); } });
+
+  const tap=(el,fn)=>{
+    el.addEventListener('touchstart',e=>{ e.preventDefault(); fn(); },{passive:false});
+    el.addEventListener('click',e=>{ e.preventDefault(); fn(); });
+  };
+  tap($('aPass'), ()=>{ if(G.S) humanPass(G.S); });
+  tap($('aShoot'),()=>{ if(G.S) humanShoot(G.S); });
+  tap($('aSwitch'),()=>{ if(G.S) cycleControl(G.S); });
+
+  const keys={};
+  addEventListener('keydown',e=>{
+    if(!CTRL.active) return;
+    keys[e.key.toLowerCase()]=true;
+    if(e.key===' '){ e.preventDefault(); if(G.S) humanShoot(G.S); }
+    if(e.key.toLowerCase()==='j'){ if(G.S) humanPass(G.S); }
+    if(e.key.toLowerCase()==='k'){ if(G.S) cycleControl(G.S); }
+    keyVec();
+  });
+  addEventListener('keyup',e=>{ keys[e.key.toLowerCase()]=false; keyVec(); });
+  function keyVec(){
+    const k=n=>keys[n]?1:0;
+    const x=k('d')+k('arrowright')-k('a')-k('arrowleft');
+    const z=k('s')+k('arrowdown')-k('w')-k('arrowup');
+    if(x||z){ const m=Math.hypot(x,z); CTRL.mx=x/m; CTRL.mz=z/m; }
+    else if(!mouse){ CTRL.mx=0; CTRL.mz=0; }
+  }
+}
+function labelActions(){
+  if(!CTRL.active||!G.S) return;
+  const holding = G.S.ball.owner===CTRL.player && CTRL.player;
+  $('aPass').textContent  = holding?'PASS':'PRESS';
+  $('aShoot').textContent = holding?'SHOOT':'TACKLE';
+}
+
 /* ---------------- main loop ---------------- */
 let last=performance.now(), statT=0;
 function loop(now){
@@ -1530,6 +1716,7 @@ function loop(now){
   $('cphase').textContent = S.ended?'FULL TIME':S.half===1?'FIRST HALF':'SECOND HALF';
   $('sh').textContent=S.score[0]; $('sa').textContent=S.score[1];
 
+  if(CTRL.active) labelActions();
   statT+=dt; if(statT>0.6){ statT=0; if($('pStats').classList.contains('on')) renderStats(); }
 
   renderFrame(S, dt);
@@ -1574,6 +1761,10 @@ function boot(){
     ['press','tempo','width'].forEach(k=>labelLever(s,k,0.5)); });
 
   document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+    if(CTRL.active && (t.dataset.p==='home'||t.dataset.p==='away')){
+      const s=t.dataset.p==='home'?0:1;
+      if(s!==CTRL.side && G.mode==='local'){ CTRL.side=s; CTRL.player=null; }
+    }
     document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
     t.classList.add('on');
     document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
@@ -1597,6 +1788,7 @@ function boot(){
   $('bReset').onclick=()=>{ startMatch(); toast('New match.'); };
   $('bBatch').onclick=()=>runBatch(5);
   $('tQual').textContent='HI';
+  initPad();
 
   Net.init().then(k=>{ menu(); });
   requestAnimationFrame(loop);
