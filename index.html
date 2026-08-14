@@ -216,6 +216,7 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
   <div class="tool" id="tCam">CAM</div>
   <div class="tool" id="tSpd">1×</div>
   <div class="tool" id="tQual">HI</div>
+  <div class="tool on" id="tAuto" style="display:none">AUTO</div>
   <div class="tool" id="tMenu">MENU</div>
 </div>
 
@@ -274,7 +275,7 @@ const LINE_KEYS = ['DEF','DM','MID','FWD'];
 
 /* Human control. When active the chosen player ignores the AI and takes the
    stick; every other player on the pitch keeps behaving normally. */
-const CTRL = { active:false, side:0, player:null, mx:0, mz:0, holdT:0 };
+const CTRL = { active:false, side:0, player:null, mx:0, mz:0, holdT:0, auto:true };
 
 /* ---- shape label: "4-2-3-1", collapsing empty bands ---- */
 function shapeLabel(lines){ return lines.filter(n=>n>0).join('-'); }
@@ -835,6 +836,7 @@ function updateControl(S){
   const team=S.teams[CTRL.side], b=S.ball;
   CTRL.holdT=Math.max(0,CTRL.holdT-0.05);
   if(b.owner && b.owner.team===team && !b.owner.gk){ CTRL.player=b.owner; return; }
+  if(!CTRL.auto && CTRL.player) return;          // manual: you keep your man
   if(CTRL.holdT>0 && CTRL.player) return;
   let best=null,bd=1e9;
   for(const p of team.players){ if(p.gk) continue;
@@ -849,6 +851,32 @@ function cycleControl(S){
   CTRL.player = rank[(i+1)%rank.length][0];
   CTRL.holdT = 2.2;
 }
+function aimTarget(S){
+  const b=S.ball, p=b.owner;
+  if(!p||p.gk||!CTRL.active||p!==CTRL.player) return null;
+  const team=p.team, dir=team.dir, gx=dir*HL;
+  const out={ from:[p.x,p.z], pass:null, shoot:null };
+
+  const q=shotQuality(S,p,team);
+  if(q>0.05) out.shoot={ x:gx, z:0, q };
+
+  const opts=passOptions(S,p,team);
+  if(opts.length){
+    let list=opts;
+    const mag=Math.hypot(CTRL.mx,CTRL.mz);
+    if(mag>0.18){
+      const ux=CTRL.mx/mag, uz=CTRL.mz/mag;
+      list=opts.map(o=>{ const dx=o.m.x-p.x, dz=o.m.z-p.z, d=Math.hypot(dx,dz)||1;
+        return {o, s:o.score+((dx/d)*ux+(dz/d)*uz)*2.4}; })
+        .sort((a,c)=>c.s-a.s).map(e=>e.o);
+    }
+    const lead=clamp(list[0].d/22,0.15,0.8);
+    out.pass={ x:list[0].m.x+list[0].m.vx*lead, z:list[0].m.z+list[0].m.vz*lead,
+               offs:list[0].offs };
+  }
+  return out;
+}
+
 function humanShoot(S){
   const b=S.ball, p=b.owner;
   if(!p||p.gk||!CTRL.active||p!==CTRL.player) return false;
@@ -941,7 +969,7 @@ function simMatch(homeLines, awayLines, tune, seed){
    RENDERER — cel shading, procedural player animation
    ============================================================ */
 let scene, cam, renderer, clockT=0;
-let PLAYERS=[], ballMesh, ballGrp, shadowMesh, pitchMesh, selRing;
+let PLAYERS=[], ballMesh, ballGrp, shadowMesh, pitchMesh, selRing, aimPass, aimShoot, aimRing;
 let QUALITY = 2;                 // 2 = full outlines, 1 = body only, 0 = none
 let CAMMODE = 0;                 // 0 tactical, 1 overhead, 2 broadcast
 const camPos = new THREE.Vector3(), camLook = new THREE.Vector3();
@@ -1122,6 +1150,34 @@ function buildStands(){
   return m;
 }
 
+function makeArrow(color){
+  const g=new THREE.Group();
+  const mat=new THREE.MeshBasicMaterial({color, transparent:true, opacity:0.52,
+    depthWrite:false, side:THREE.DoubleSide});
+  const sg=new THREE.PlaneGeometry(0.30,1); sg.rotateX(-Math.PI/2); sg.translate(0,0,0.5);
+  const shaft=new THREE.Mesh(sg,mat);
+  const tg=new THREE.BufferGeometry();
+  tg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(
+    [-0.60,0,0,  0.60,0,0,  0,0,1.30]),3));
+  tg.computeVertexNormals();
+  const head=new THREE.Mesh(tg,mat);
+  g.add(shaft); g.add(head);
+  g.userData={shaft,head}; g.visible=false;
+  return g;
+}
+function pointArrow(g, fx,fz, tx,tz){
+  const dx=tx-fx, dz=tz-fz, d=Math.hypot(dx,dz);
+  if(d<1.6){ g.visible=false; return; }
+  g.visible=true;
+  g.position.set(fx,0.06,fz);
+  g.rotation.y=Math.atan2(dx,dz);
+  const HEAD=1.30, gap=0.85;
+  const shaftLen=Math.max(d-HEAD-gap, 0.15);
+  g.userData.shaft.scale.z=shaftLen;
+  g.userData.shaft.position.z=gap;
+  g.userData.head.position.z=gap+shaftLen;
+}
+
 function initScene(canvas){
   renderer = new THREE.WebGLRenderer({canvas, antialias:true, powerPreference:'high-performance'});
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));
@@ -1160,6 +1216,13 @@ function initScene(canvas){
     new THREE.MeshBasicMaterial({color:0x000000,transparent:true,opacity:0.30,depthWrite:false}), 23);
   shadowMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(shadowMesh);
+
+  aimPass  = makeArrow(0xF4F7FA); scene.add(aimPass);
+  aimShoot = makeArrow(0xE2453D); scene.add(aimShoot);
+  aimRing  = new THREE.Mesh(new THREE.RingGeometry(0.72,0.92,22),
+    new THREE.MeshBasicMaterial({color:0xF4F7FA,transparent:true,opacity:0.55,
+      depthWrite:false,side:THREE.DoubleSide}));
+  aimRing.rotation.x=-Math.PI/2; aimRing.visible=false; scene.add(aimRing);
 
   selRing = new THREE.Mesh(new THREE.RingGeometry(0.52,0.70,22),
     new THREE.MeshBasicMaterial({color:0xF4F7FA,transparent:true,opacity:0.85,
@@ -1218,6 +1281,21 @@ function renderFrame(S, dt){
     selRing.position.set(CTRL.player.x, 0.04, CTRL.player.z);
   } else selRing.visible=false;
 
+  const aim = (typeof aimTarget==='function') ? aimTarget(S) : null;
+  if(aim){
+    if(aim.pass){
+      pointArrow(aimPass, aim.from[0], aim.from[1], aim.pass.x, aim.pass.z);
+      aimRing.visible=true; aimRing.position.set(aim.pass.x, 0.05, aim.pass.z);
+      const off = aim.pass.offs;
+      aimPass.userData.shaft.material.color.setHex(off?0xF2A93B:0xF4F7FA);
+      aimRing.material.color.setHex(off?0xF2A93B:0xF4F7FA);
+    } else { aimPass.visible=false; aimRing.visible=false; }
+    if(aim.shoot){
+      pointArrow(aimShoot, aim.from[0], aim.from[1], aim.shoot.x, aim.shoot.z);
+      aimShoot.userData.shaft.material.opacity = 0.28 + aim.shoot.q*0.5;
+    } else aimShoot.visible=false;
+  } else { aimPass.visible=false; aimShoot.visible=false; aimRing.visible=false; }
+
   updateCamera(S, dt);
   renderer.render(scene, cam);
 }
@@ -1231,9 +1309,12 @@ function updateCamera(S, dt){
   } else if(CAMMODE===1){                // overhead — pure shape read
     const d = fitDistance();
     tx=0; ty=d*1.02; tz=0.01; lx=0; ly=0; lz=0;
-  } else {                               // broadcast — follows play
-    tx=clamp(b.x*0.55,-26,26); ty=30; tz=b.z*0.22+30;
-    lx=clamp(b.x*0.75,-40,40); ly=0; lz=b.z*0.35;
+  } else {                               // broadcast — follows play from outside the pitch
+    const d = fitDistance()*0.66;
+    tx = clamp(b.x*0.48,-22,22);
+    ty = d*0.56;
+    tz = d*0.84 + b.z*0.10;
+    lx = clamp(b.x*0.80,-40,40); ly=0; lz=b.z*0.22;
   }
   const k = Math.min(1, dt*(CAMMODE===2?2.6:4.5));
   camPos.lerp(_v3.set(tx,ty,tz), k);
@@ -1570,6 +1651,7 @@ function menu(){
     CTRL.active = (ctl==='play' && G.mode!=='guest');
     CTRL.side = G.side; CTRL.player=null; CTRL.mx=CTRL.mz=0;
     $('pad').classList.toggle('on', CTRL.active);
+    $('tAuto').style.display = CTRL.active ? 'flex' : 'none';
     if(CTRL.active){
       CAMMODE=2; $('tCam').textContent='TV'; $('tCam').classList.add('on');
       $('dock').classList.add('hid'); $('glbl').textContent='TACTICS';
@@ -1784,6 +1866,13 @@ function boot(){
   $('tQual').onclick=()=>{ QUALITY=(QUALITY+2)%3;
     $('tQual').textContent=['LO','MID','HI'][QUALITY];
     $('tQual').classList.toggle('on',QUALITY<2); buildTeams(G.S); };
+  $('tAuto').onclick=()=>{
+    CTRL.auto=!CTRL.auto;
+    $('tAuto').textContent = CTRL.auto?'AUTO':'MAN';
+    $('tAuto').classList.toggle('on', CTRL.auto);
+    toast(CTRL.auto ? 'Switching automatically to the nearest player.'
+                    : 'Manual switching — use SWITCH to change man.');
+  };
   $('tMenu').onclick=menu;
   $('bReset').onclick=()=>{ startMatch(); toast('New match.'); };
   $('bBatch').onclick=()=>runBatch(5);
