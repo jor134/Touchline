@@ -264,6 +264,7 @@ const PL = 105, PW = 68, HL = PL/2, HW = PW/2;      // pitch metres
 const GOALW = 7.32, GPOST = GOALW/2, GBAR = 2.44;
 const BOXX = 16.5, BOXZ = 20.16, SIXX = 5.5, SIXZ = 9.16;
 
+const GK_REACT = 0.24;      // keepers are not psychic
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
 const lerp=(a,b,t)=>a+(b-a)*t;
 const dist2=(ax,az,bx,bz)=>{const dx=ax-bx,dz=az-bz;return dx*dx+dz*dz;};
@@ -411,9 +412,16 @@ function gkTarget(S, team){
   const ux = (b.x-gx)/d, uz = b.z/d;
   let tx = gx + ux*out, tz = uz*out;
   // track a live shot toward the projected crossing point
-  if(b.shot && !b.owner && (gx-b.x)*b.vx>0 && Math.abs(b.vx)>1){
+  if(b.shot && !b.owner && (b.shotAge||0)>GK_REACT && (gx-b.x)*b.vx>0 && Math.abs(b.vx)>1){
     const t=(gx-b.x)/b.vx;
-    if(t>0&&t<1.6){ tz = clamp(b.z+b.vz*t, -GPOST-1.2, GPOST+1.2); tx = gx+ux*1.0; }
+    if(t>0&&t<1.6){
+      if(b.gkCommit===undefined){                 // one read, then he's committed
+        const spd=Math.hypot(b.vx,b.vz);
+        const err=(S.rng()*2-1)*(0.45+spd*0.042)*(b.human?1.25:0.55);
+        b.gkCommit = clamp(b.z+b.vz*t+err, -GPOST-1.6, GPOST+1.6);
+      }
+      tz = b.gkCommit; tx = gx+ux*1.0;
+    }
   }
   // sweep a loose ball outside the box
   else if(!b.owner && d<20 && Math.abs(b.z)<13 && Math.hypot(b.vx,b.vz)<9){
@@ -483,7 +491,7 @@ function kickBall(S, b, tx, tz, speed, loft, errRad){
   const d = Math.max(dist(b.x,b.z,tx,tz),0.1);
   let ang = Math.atan2(tz-b.z, tx-b.x) + (S.rng()*2-1)*errRad;
   b.vx = Math.cos(ang)*speed; b.vz = Math.sin(ang)*speed;
-  b.vy = loft; b.owner=null; b.ownerT=0; b.spin = speed*0.35; S.contest=0.26;
+  b.vy = loft; b.owner=null; b.ownerT=0; b.spin = speed*0.35; S.contest=0.26; b.gkCommit=undefined;
 }
 
 function decide(S, dt){
@@ -514,14 +522,16 @@ function decide(S, dt){
   const shootBar = lerp(0.46, 0.27, team.tempo) + pressure*0.08;
   if(q > shootBar){
     st.shots++; st.xg += q*0.30;
-    const aimZ = clamp((S.rng()*2-1)*GPOST*0.86, -GPOST*0.9, GPOST*0.9);
+    const side = S.rng()<0.5?-1:1;
+    const aimZ = side*GPOST*(0.50+S.rng()*0.44);
     const acc = lerp(0.115, 0.035, q) * (1+pressure*0.7);
     kickBall(S,b,gx,aimZ, 24+S.rng()*8, 1.2+S.rng()*2.6, acc);
     b.passer=p; b.intended=null; b.passT=S.clock; b.shot=true; b.shooter=ti; b.offsideFlag=false;
     // will it actually hit the target?
     const tt=(gx-b.x)/(b.vx||1e-6);
     const cz=b.z+b.vz*tt, cy=b.y+b.vy*tt-0.5*17.5*tt*tt;
-    b.onTarget = (tt>0 && Math.abs(cz)<GPOST && cy>0 && cy<GBAR);
+    b.onTarget = (tt>0 && Math.abs(cz)<GPOST && cy<GBAR);
+    b.shotAge=0; b.shotDist=dist(p.x,p.z,gx,0); b.human=false;
     if(b.onTarget) st.sot++;
     S.event={type:'shot',team:ti}; return;
   }
@@ -606,7 +616,7 @@ function updateTeam(S, ti, dt){
     p.team=team;
     if(p.gk){
       const [gx,gz]=gkTarget(S,team);
-      steer(p,gx,gz, b.owner===p?4.2:7.0, dt);
+      steer(p,gx,gz, b.owner===p?4.2:5.9, dt);
       continue;
     }
     let tx,tz,spd=baseSpd*(p.agi||1);
@@ -675,6 +685,7 @@ function updateBall(S, dt){
     b.y = 0.11; b.vx=p.vx; b.vz=p.vz; b.vy=0; b.spin=p.spd*2.4;
     return;
   }
+  b.shotAge=(b.shotAge||0)+dt;
   b.x+=b.vx*dt; b.z+=b.vz*dt; b.y+=b.vy*dt; b.vy-=17.5*dt;
   if(b.y<=0.11){ b.y=0.11; if(b.vy<-0.4){ b.vy*=-0.52; } else b.vy=0;
     const f=Math.exp(-1.05*dt); b.vx*=f; b.vz*=f; }
@@ -718,8 +729,10 @@ function contestBall(S, dt){
   const px=b.x-b.vx*dt, pz=b.z-b.vz*dt;
   const spd=Math.hypot(b.vx,b.vz);
   let best=null,bd=1e9,bt=0;
+  const bspd=Math.hypot(b.vx,b.vz);
   for(let ti=0;ti<2;ti++) for(const p of S.teams[ti].players){
-    const reach = p.gk?2.5:1.35;
+    if(p.gk && b.shot) continue;                 // a live shot is keeperSave's business
+    const reach = p.gk ? (bspd>17?1.5:2.5) : 1.35;
     const d = segDist(p.x,p.z, px,pz, b.x,b.z);
     if(d>reach) continue;
     let w = d + (p===b.passer?9:0) - (p===b.intended?1.15:0);
@@ -774,10 +787,14 @@ function keeperSave(S, dt){
     if(dist(b.x,b.z,gx,0)>18) continue;
     const spd=Math.hypot(b.vx,b.vz);
     const d = segDist(gk.x,gk.z, b.x-b.vx*dt, b.z-b.vz*dt, b.x, b.z);
-    const reach = 1.15 + clamp((26-spd)/26,0,1)*1.15;
+    const close = clamp((18-(b.shotDist!==undefined?b.shotDist:18))/18, 0, 1);
+    const you = !!b.human;
+    // a dive is extension, not footspeed: fast shots give less time to extend
+    const base = clamp(3.05 - spd*0.045, 1.15, 2.75);
+    const reach = base * (1 - close*(you?0.58:0.26)) * (you?0.78:1.00);
     if(d<reach){
       gk.dive = clamp((b.z-gk.z)*0.6,-1,1); gk.diveT=0.5;
-      const hold = S.rng() < clamp(0.55 - spd/95, 0.12, 0.65);
+      const hold = S.rng() < clamp(0.55 - spd/95 - close*(you?0.38:0.06), 0.05, 0.68);
       if(hold){ b.owner=gk; b.ownerT=0; b.shot=false; b.passer=null; b.intended=null; S.decideT=1.0; }
       else { const a=Math.atan2(b.z-gk.z, b.x-gk.x)+(S.rng()*2-1)*1.0;
         b.vx=Math.cos(a)*-8; b.vz=Math.sin(a)*10; b.vy=3.6;
@@ -884,12 +901,14 @@ function humanShoot(S){
   const team=p.team, ti=S.teams.indexOf(team), dir=team.dir, gx=dir*HL;
   const q=shotQuality(S,p,team);
   S.stats[ti].shots++; S.stats[ti].xg += q*0.30;
-  const aimZ=clamp((S.rng()*2-1)*GPOST*0.82,-GPOST*0.9,GPOST*0.9);
+  const side = (Math.abs(CTRL.mz)>0.35 ? (CTRL.mz>0?1:-1) : (S.rng()<0.5?-1:1));
+  const aimZ = side*GPOST*(0.52+S.rng()*0.42);
   const acc=lerp(0.105,0.028,q);
   kickBall(S,b,gx,aimZ,25+S.rng()*7,1.3+S.rng()*2.4,acc);
   b.passer=p; b.intended=null; b.passT=S.clock; b.shot=true; b.offsideFlag=false;
   const tt=(gx-b.x)/(b.vx||1e-6), cz=b.z+b.vz*tt, cy=b.y+b.vy*tt-0.5*17.5*tt*tt;
-  b.onTarget=(tt>0&&Math.abs(cz)<GPOST&&cy>0&&cy<GBAR);
+  b.onTarget=(tt>0&&Math.abs(cz)<GPOST&&cy<GBAR);
+  b.shotAge=0; b.shotDist=dist(p.x,p.z,gx,0); b.human=true;
   if(b.onTarget) S.stats[ti].sot++;
   S.decideT=0.7; S.event={type:'shot',team:ti};
   return true;
