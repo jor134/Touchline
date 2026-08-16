@@ -38,11 +38,29 @@ html,body{height:100%;overflow:hidden;background:var(--ink);color:var(--chalk);
 #ctime{font-family:'Barlow Condensed';font-weight:600;font-size:17px;line-height:1}
 #cphase{font-size:8.5px;color:var(--faint);letter-spacing:.13em;font-weight:600}
 
+#netbadge{display:flex;align-items:center;gap:6px;padding:0 10px;
+  border-left:1px solid var(--line);font-size:9px;letter-spacing:.12em;font-weight:600;color:var(--dim)}
+#netdot{width:7px;height:7px;border-radius:50%;background:var(--amber);flex:0 0 auto}
+#netbadge.live #netdot{background:var(--turf)} #netbadge.lost #netdot{background:var(--home)}
+.sg.off{opacity:.32;pointer-events:none}
+#diag{font-size:11px;line-height:1.55;color:var(--amber);background:rgba(242,169,59,.09);
+  border:1px solid rgba(242,169,59,.3);border-radius:8px;padding:9px 11px;margin-top:10px}
+#diag b{color:var(--chalk);font-weight:600}
 #flash{position:fixed;top:50%;left:0;right:0;text-align:center;transform:translateY(-50%);
   font-family:'Barlow Condensed';font-weight:700;font-size:15vw;letter-spacing:.06em;
   opacity:0;pointer-events:none;z-index:19;text-shadow:0 6px 30px rgba(0,0,0,.7)}
 
 /* ---------- top-left controls ---------- */
+#replay{position:fixed;left:50%;transform:translateX(-50%);
+  top:calc(58px + env(safe-area-inset-top,0px));z-index:23;display:none;align-items:center;gap:9px;
+  padding:6px 8px 6px 12px;border-radius:8px;background:rgba(12,17,22,.85);
+  border:1px solid var(--line);backdrop-filter:blur(12px);
+  font-family:'Barlow Condensed';font-weight:700;font-size:13px;letter-spacing:.18em;color:var(--chalk)}
+#replay.on{display:flex}
+.rdot{width:8px;height:8px;border-radius:50%;background:var(--home);animation:rp 1s infinite}
+@keyframes rp{0%,100%{opacity:1}50%{opacity:.25}}
+#rskip{font-size:11px;letter-spacing:.12em;color:var(--dim);padding:3px 9px;
+  border-radius:5px;background:var(--panel2);cursor:pointer}
 #tools{position:fixed;top:calc(8px + env(safe-area-inset-top,0px));left:8px;
   display:flex;flex-direction:column;gap:5px;z-index:21}
 .tool{width:38px;height:32px;border-radius:8px;background:rgba(21,29,37,.85);
@@ -207,10 +225,12 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
   <div class="bteam"><div><div class="bname" id="an" style="text-align:right">AWAY</div>
     <div class="bshape num" id="as" style="text-align:right">4-4-2</div></div>
     <div class="chip" style="background:var(--away)"></div></div>
+  <div id="netbadge" style="display:none"><span id="netdot"></span><span id="nettxt">…</span></div>
   <div id="clock"><div id="ctime" class="num">0'</div><div id="cphase">KICK OFF</div></div>
 </div></div>
 
 <div id="flash" class="num"></div>
+<div id="replay"><span class="rdot"></span>REPLAY<span id="rskip">SKIP</span></div>
 
 <div id="tools">
   <div class="tool" id="tCam">CAM</div>
@@ -990,7 +1010,8 @@ function simMatch(homeLines, awayLines, tune, seed){
    ============================================================ */
 let scene, cam, renderer, clockT=0;
 let PLAYERS=[], ballMesh, ballGrp, shadowMesh, pitchMesh, selRing, aimPass, aimShoot, aimRing;
-const BASE_FOV = 34, TV_FOV = 26;   // TV uses a longer lens to zoom on play
+const BASE_FOV = 34, TV_FOV = 26, RP_FOV = 30;
+let replayAng = 0;   // TV uses a longer lens to zoom on play
 let QUALITY = 2;                 // 2 = full outlines, 1 = body only, 0 = none
 let CAMMODE = 0;                 // 0 tactical, 1 overhead, 2 broadcast
 const camPos = new THREE.Vector3(), camLook = new THREE.Vector3();
@@ -1330,6 +1351,14 @@ function updateCamera(S, dt){
   } else if(CAMMODE===1){                // overhead — pure shape read
     const d = fitDistance(BASE_FOV);
     tx=0; ty=d*1.02; tz=0.01; lx=0; ly=0; lz=0;
+  } else if(CAMMODE===3){                // replay — low and circling
+    replayAng += dt*0.30;
+    const R=27;
+    tx = clamp(b.x + Math.sin(replayAng)*R, -70, 70);
+    ty = 10.5;
+    tz = b.z + Math.cos(replayAng)*R + 6;
+    lx = b.x; ly = 0.9; lz = b.z;
+    fov = RP_FOV;
   } else {                               // broadcast — tight on the ball, longer lens
     const fx = clamp(b.x, -40, 40), fz = clamp(b.z*0.6, -17, 17);
     tx = fx*0.88; ty = 27; tz = 47 + fz*0.25;   // never inside the touchline
@@ -1340,7 +1369,7 @@ function updateCamera(S, dt){
     cam.fov += (fov-cam.fov)*Math.min(1, dt*3.5);
     cam.updateProjectionMatrix();
   }
-  const k = Math.min(1, dt*(CAMMODE===2?3.2:4.5));
+  const k = Math.min(1, dt*(CAMMODE===2?3.2:CAMMODE===3?5.5:4.5));
   camPos.lerp(_v3.set(tx,ty,tz), k);
   camLook.lerp(_v3.set(lx,ly,lz), k);
   cam.position.copy(camPos);
@@ -1389,30 +1418,74 @@ function flash(text,color){
 
 /* ---------------- networking ---------------- */
 const Net = {
-  kind:'none',
-  async init(){
-    if(window.storage && window.storage.set){ this.kind='artifact'; return 'artifact'; }
+  kind:'none', detail:'', hint:'',
+  async probe(){
+    // 1) artifact runtime bridge
+    if(window.storage && typeof window.storage.set==='function'){
+      try{
+        await window.storage.set('tl_probe', String(Date.now()), true);
+        this.kind='artifact'; this.detail='Shared artifact storage.'; this.hint='';
+        return this;
+      }catch(e){
+        this.kind='none';
+        this.detail='A storage bridge exists but rejected a write.';
+        this.hint='This usually means the file is running in a preview rather than as a published artifact.';
+        return this;
+      }
+    }
+    // 2) your own server route
     try{
-      const r = await fetch('/api/room?key=tl_ping', {method:'GET'});
-      if(r.ok){ this.kind='api'; return 'api'; }
-    }catch(e){}
-    this.kind='none'; return 'none';
+      const r = await fetch('/api/room?key=tl_ping', {cache:'no-store'});
+      if(r.ok){ this.kind='api'; this.detail='Server storage at /api/room.'; this.hint=''; return this; }
+      if(r.status===503){
+        this.kind='none'; this.detail='/api/room answered, but KV is not configured.';
+        this.hint='Set KV_REST_API_URL and KV_REST_API_TOKEN in your Vercel project, then redeploy.';
+      } else {
+        this.kind='none'; this.detail='/api/room returned '+r.status+'.';
+        this.hint='Check that api/room.js is committed at that exact path.';
+      }
+    }catch(e){
+      this.kind='none';
+      this.detail='No shared storage on this host.';
+      this.hint='Rooms need either a published artifact URL, or api/room.js deployed alongside this page.';
+    }
+    return this;
   },
   async set(k,v){
     const s=JSON.stringify(v);
-    if(this.kind==='artifact') return window.storage.set(k,s,true);
-    if(this.kind==='api') return fetch('/api/room',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:s})});
+    try{
+      if(this.kind==='artifact') return await window.storage.set(k,s,true);
+      if(this.kind==='api') return await fetch('/api/room',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:s})});
+    }catch(e){ netTrouble(); }
   },
   async get(k){
     try{
       if(this.kind==='artifact'){ const r=await window.storage.get(k,true); return r?JSON.parse(r.value):null; }
-      if(this.kind==='api'){ const r=await fetch('/api/room?key='+encodeURIComponent(k));
-        if(!r.ok) return null; const j=await r.json(); return j&&j.value?JSON.parse(j.value):null; }
+      if(this.kind==='api'){
+        const r=await fetch('/api/room?key='+encodeURIComponent(k),{cache:'no-store'});
+        if(!r.ok) return null;
+        const j=await r.json(); return j&&j.value?JSON.parse(j.value):null;
+      }
     }catch(e){ return null; }
     return null;
   }
 };
+function netTrouble(){ G.netErr=(G.netErr||0)+1; }
+function netMark(){ G.netLast=performance.now(); G.netErr=0; }
+function netBadge(){
+  const b=$('netbadge'); if(!b) return;
+  if(G.mode==='local'){ b.style.display='none'; return; }
+  b.style.display='flex';
+  const age = performance.now()-(G.netLast||0);
+  let s,t;
+  if(!G.netLast){ s=''; t=G.mode==='host'?'WAITING':'FINDING'; }
+  else if(age<2600){ s='live'; t='LIVE'; }
+  else if(age<9000){ s=''; t='SLOW'; }
+  else { s='lost'; t='LOST'; }
+  b.className=s; $('nettxt').textContent=t+' '+G.room;
+}
+
 const roomKey=(c,s)=>'tl_'+c+'_'+s;
 
 function snapshot(S){
@@ -1630,6 +1703,11 @@ function closeOverlay(){ $('ov').classList.add('off'); G.running=true; }
 
 function menu(){
   const net = Net.kind!=='none';
+  const diag = net
+    ? `<div id="diag" style="border-color:rgba(47,181,107,.35);background:rgba(47,181,107,.08);color:var(--turf)">
+         <b>Rooms are available.</b> ${Net.detail}</div>`
+    : `<div id="diag"><b>Rooms are unavailable here.</b> ${Net.detail}
+         ${Net.hint?'<br>'+Net.hint:''}</div>`;
   overlay(`<h1>TOUCHLINE</h1><div class="sub">FORMATION LAB</div>
     <h2>MATCH LENGTH</h2>
     <div class="seg" id="segLen">
@@ -1643,11 +1721,11 @@ function menu(){
     <h2>PLAY WITH A FRIEND</h2>
     <div class="seg" id="segMode">
       <div class="sg on" data-v="local">ONE PHONE</div>
-      <div class="sg" data-v="host">HOST ROOM</div>
-      <div class="sg" data-v="join">JOIN ROOM</div></div>
+      <div class="sg${net?'':' off'}" data-v="host">HOST ROOM</div>
+      <div class="sg${net?'':' off'}" data-v="join">JOIN ROOM</div></div>
     <div id="roomBox"></div>
-    <p id="note" style="display:${net?'none':'block'}">Online rooms need storage that isn't
-    available here, so only One Phone will work in this build.</p>
+    ${diag}
+    <div class="brow"><div class="btn gh" id="retest">TEST CONNECTION AGAIN</div></div>
     <div class="brow"><div class="btn pri" id="go">KICK OFF</div></div>
     <p style="margin-top:14px;font-size:11px;color:var(--faint)">Both benches are open on one phone —
     swap tabs and pass it around. Formation and levers can change at any moment during play.</p>`, false);
@@ -1666,8 +1744,16 @@ function menu(){
       `<p>Type the code your friend gave you.</p><input id="rin" maxlength="4" placeholder="————">`; }
     else $('roomBox').innerHTML='';
   };
+  $('retest').onclick=async()=>{
+    $('retest').textContent='CHECKING…';
+    await Net.probe();
+    menu();
+    toast(Net.kind!=='none' ? 'Rooms are available.' : 'Still no shared storage.');
+  };
   $('go').onclick=()=>{
     G.realSecs=len;
+    if(mode!=='local' && Net.kind==='none'){
+      toast('No shared storage — rooms cannot connect here.'); return; }
     if(mode==='join'){ const v=($('rin')?.value||'').toUpperCase().trim();
       if(v.length!==4){ toast('That code needs four letters.'); return; } G.room=v; }
     G.mode = mode==='join'?'guest':mode;
@@ -1681,9 +1767,10 @@ function menu(){
       $('dock').classList.add('hid'); $('glbl').textContent='TACTICS';
     }
     if(ctl==='play' && mode==='join') toast('Controls are one-phone only for now.');
+    G.netLast=0; G.netErr=0;
     startMatch();
     closeOverlay();
-    if(G.mode!=='local') startNet();
+    if(G.mode!=='local'){ G.joinAt=performance.now(); startNet(); }
   };
 }
 const code=()=>{ let s=''; for(let i=0;i<4;i++) s+='ABCDEFGHJKLMNPQRSTUVWXYZ'[(Math.random()*24)|0]; return s; };
@@ -1699,6 +1786,7 @@ function startMatch(){
     T.width=lerp(0.50,1.0,+$(`ln_${i}_width`).value/100);
   });
   buildTeams(G.S);
+  RB.buf.length=0; RB.acc=0; G.replay=null; $('replay').classList.remove('on');
   $('hs').textContent=shapeLabel(G.lines[0]);
   $('as').textContent=shapeLabel(G.lines[1]);
   $('sh').textContent='0'; $('sa').textContent='0';
@@ -1712,17 +1800,20 @@ async function startNet(){
     setInterval(async()=>{ if(G.S) Net.set(roomKey(G.room,'snap'), snapshot(G.S)); }, 220);
     setInterval(async()=>{
       const t=await Net.get(roomKey(G.room,'away'));
+      if(t) netMark();
       if(t && G.S){ const T=G.S.teams[1];
         if(shapeLabel(T.lines)!==shapeLabel(t.l)){ reshape(T,t.l); G.lines[1]=t.l.slice();
           $('as').textContent=shapeLabel(t.l); syncWheels(1); }
         T.press=t.p; T.tempo=t.t; T.width=t.w; }
     }, 500);
   } else {
-    toast('Joining '+G.room+'…');
+    toast('Looking for room '+G.room+'…');
+    pushGuestTactics();
     setInterval(async()=>{
       const s=await Net.get(roomKey(G.room,'snap'));
-      if(s && G.S){ applySnapshot(G.S,s); G.netOK=true; }
+      if(s && G.S){ applySnapshot(G.S,s); netMark(); }
     }, 220);
+    setInterval(pushGuestTactics, 1500);
   }
 }
 function pushGuestTactics(){
@@ -1792,6 +1883,77 @@ function labelActions(){
   $('aShoot').textContent = holding?'SHOOT':'TACKLE';
 }
 
+/* ---------------- goal replay ----------------
+   A rolling buffer of light position frames. On a goal we freeze the live
+   state, play the last few seconds back from a low circling camera, then put
+   everything exactly where it was and kick off. */
+const RB = { buf:[], max:150, acc:0, HZ:20 };
+
+function allPlayers(S){ return S.teams[0].players.concat(S.teams[1].players); }
+function captureFrame(S){
+  const ps=allPlayers(S), f=new Float32Array(3+ps.length*5);
+  f[0]=S.ball.x; f[1]=S.ball.y; f[2]=S.ball.z;
+  for(let i=0;i<ps.length;i++){
+    const p=ps[i], o=3+i*5;
+    f[o]=p.x; f[o+1]=p.z; f[o+2]=p.yaw; f[o+3]=p.phase; f[o+4]=p.spd;
+  }
+  return f;
+}
+function applyFrame(S,f){
+  const ps=allPlayers(S);
+  S.ball.x=f[0]; S.ball.y=f[1]; S.ball.z=f[2];
+  for(let i=0;i<ps.length;i++){
+    const p=ps[i], o=3+i*5;
+    p.x=f[o]; p.z=f[o+1]; p.yaw=f[o+2]; p.phase=f[o+3]; p.spd=f[o+4];
+  }
+}
+function lerpFrame(a,b,t){
+  const f=new Float32Array(a.length);
+  for(let i=0;i<a.length;i++){
+    if((i-2)%5===2 && i>2){                     // yaw: take the short way round
+      let d=b[i]-a[i]; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI;
+      f[i]=a[i]+d*t;
+    } else f[i]=a[i]+(b[i]-a[i])*t;
+  }
+  return f;
+}
+function recordFrame(dt){
+  if(G.replay || !G.running || !G.S) return;
+  RB.acc+=dt;
+  if(RB.acc < 1/RB.HZ) return;
+  RB.acc=0;
+  RB.buf.push(captureFrame(G.S));
+  if(RB.buf.length>RB.max) RB.buf.shift();
+}
+function startReplay(){
+  if(G.S.ended || G.mode==='guest' || RB.buf.length<20) return;
+  const SECS=3.6, want=Math.round(SECS*RB.HZ);
+  G.replay = {
+    frames: RB.buf.slice(Math.max(0, RB.buf.length-want)),
+    live: captureFrame(G.S),          // where the match must resume from
+    cam: CAMMODE, i:0, rate:0.68
+  };
+  CAMMODE=3; replayAng=0.7;
+  G.running=false;
+  $('replay').classList.add('on');
+  $('dock').classList.add('hid');
+}
+function endReplay(){
+  if(!G.replay) return;
+  applyFrame(G.S, G.replay.live);
+  CAMMODE = G.replay.cam;
+  G.replay=null; RB.buf.length=0; RB.acc=0;
+  $('replay').classList.remove('on');
+  G.running=true;
+}
+function stepReplay(dt){
+  const R=G.replay, F=R.frames;
+  R.i += dt*RB.HZ*R.rate;
+  if(R.i >= F.length-1){ endReplay(); return; }
+  const k=Math.floor(R.i), t=R.i-k;
+  applyFrame(G.S, lerpFrame(F[k], F[Math.min(k+1,F.length-1)], t));
+}
+
 /* ---------------- main loop ---------------- */
 let last=performance.now(), statT=0;
 function loop(now){
@@ -1799,14 +1961,21 @@ function loop(now){
   let dt=Math.min((now-last)/1000, 0.05); last=now;
   const S=G.S; if(!S){ return; }
 
-  if(G.running && G.mode!=='guest'){
+  if(G.replay){
+    stepReplay(dt);
+  } else if(G.running && G.mode!=='guest'){
     const sub = G.speed;
     for(let i=0;i<sub;i++){
       step(S, dt);
+      recordFrame(dt);
       if(S.event) handleEvent(S.event);
-      if(S.ended) break;
+      if(S.ended || G.replay) break;
     }
   } else if(G.mode==='guest'){
+    if(!G.netLast){
+      const secs=((performance.now()-(G.joinAt||performance.now()))/1000)|0;
+      $('cphase').textContent = secs>12 ? 'NO HOST FOUND' : 'CONNECTING…';
+    }
     // ease toward the host's positions
     for(const t of S.teams) for(const p of t.players){
       if(p.nx===undefined) continue;
@@ -1823,12 +1992,13 @@ function loop(now){
   $('sh').textContent=S.score[0]; $('sa').textContent=S.score[1];
 
   if(CTRL.active) labelActions();
+  netBadge();
   statT+=dt; if(statT>0.6){ statT=0; if($('pStats').classList.contains('on')) renderStats(); }
 
   renderFrame(S, dt);
 }
 function handleEvent(e){
-  if(e.type==='goal'){ flash('GOAL', e.team?'#3D86E2':'#E2453D'); CAMMODE_pulse(); }
+  if(e.type==='goal'){ flash('GOAL', e.team?'#3D86E2':'#E2453D'); setTimeout(startReplay, 620); }
   else if(e.type==='half') flash('HALF TIME');
   else if(e.type==='ft'){ flash('FULL TIME'); setTimeout(fullTime, 1400); }
   else if(e.type==='restart' && e.label==='OFFSIDE') flash('OFFSIDE','#F2A93B');
@@ -1897,13 +2067,14 @@ function boot(){
     toast(CTRL.auto ? 'Switching automatically to the nearest player.'
                     : 'Manual switching — use SWITCH to change man.');
   };
+  $('rskip').onclick=endReplay;
   $('tMenu').onclick=menu;
   $('bReset').onclick=()=>{ startMatch(); toast('New match.'); };
   $('bBatch').onclick=()=>runBatch(5);
   $('tQual').textContent='HI';
   initPad();
 
-  Net.init().then(k=>{ menu(); });
+  Net.probe().then(()=>menu());
   requestAnimationFrame(loop);
 }
 if(document.readyState==='loading') addEventListener('DOMContentLoaded',boot); else boot();
